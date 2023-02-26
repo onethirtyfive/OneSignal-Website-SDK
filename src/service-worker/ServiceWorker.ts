@@ -2,7 +2,7 @@ import bowser, { IBowser } from "bowser";
 
 import Environment from "../Environment";
 import { WorkerMessenger, WorkerMessengerCommand, WorkerMessengerMessage } from "../libraries/WorkerMessenger";
-import ContextSW from "../models/ContextSW";
+import ContextSW, { ContextSWInterface } from "../models/ContextSW";
 import OneSignalApiBase from "../OneSignalApiBase";
 import OneSignalApiSW from "../OneSignalApiSW";
 import Database from "../services/Database";
@@ -28,7 +28,6 @@ import { NotificationReceived, NotificationClicked } from "../models/Notificatio
 import { cancelableTimeout } from "../helpers/sw/CancelableTimeout";
 import { DeviceRecord } from '../models/DeviceRecord';
 import { awaitableTimeout } from "../utils/AwaitableTimeout";
-import { warn } from "console";
 
 declare var self: ServiceWorkerGlobalScope & OSServiceWorkerFields;
 
@@ -46,7 +45,8 @@ const MAX_CONFIRMED_DELIVERY_DELAY = 25;
 // Step 2: extract an interface for `OSServiceWorker` implementation details;
 //         put that aside, make `OSServiceWorker` explicitly `any`-- it has
 //         nothing to do with ts-lib-provided `ServiceWorker` interface.
-interface OSServiceWorkerImplementationDetails {
+// Step 3: conform to interface, fix most diagnostics
+interface OSServiceWorker {
   UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
   VERSION: number;
   environment: Environment;
@@ -94,7 +94,7 @@ interface OSServiceWorkerImplementationDetails {
   isValidPushPayload(rawData: any): boolean;
 }
 
-const definitionInjecting = () : any => {
+const mkServiceWorker = (options: any) : OSServiceWorker => {
   /**
    * The main service worker script fetching and displaying notifications to users in the background even when the client
    * site is not running. The worker is registered via the navigator.serviceWorker.register() call after the user first
@@ -103,41 +103,33 @@ const definitionInjecting = () : any => {
    * For HTTPS sites, the service worker is registered site-wide at the top-level scope. For HTTP sites, the service
    * worker is registered to the iFrame pointing to subdomain.onesignal.com.
    */
-  class OSServiceWorker  {
-    static UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
+  const workerMessenger = options.workerMessenger;
+
+  return {
+    UNSUBSCRIBED_FROM_NOTIFICATIONS: undefined,
 
     /**
      * An incrementing integer defined in package.json. Value doesn't matter as long as it's different from the
      * previous version.
      */
-    static get VERSION() {
-      return Environment.version();
-    }
+    VERSION: Environment.version(),
 
     /**
      * Describes what context the JavaScript code is running in and whether we're running in local development mode.
      */
-    static get environment() {
-      return Environment;
-    }
+    environment: Environment,
 
-    static get log() {
-      return Log;
-    }
+    log: Log,
 
     /**
      * An interface to the browser's IndexedDB.
      */
-    static get database() {
-      return Database;
-    }
+    database: Database,
 
     /**
      * Describes the current browser name and version.
      */
-    static get browser() {
-      return bowser;
-    }
+    browser: bowser,
 
     /**
      * Allows message passing between this service worker and pages on the same domain.
@@ -145,25 +137,20 @@ const definitionInjecting = () : any => {
      * events like notification dismissed, clicked, and displayed to be fired on the clients. It also allows the
      * clients to communicate with the service worker to close all active notifications.
      */
-    static get workerMessenger(): WorkerMessenger {
-      if (!(self as any).workerMessenger) {
-        (self as any).workerMessenger = new WorkerMessenger(null);
-      }
-      return (self as any).workerMessenger;
-    }
+    workerMessenger: workerMessenger,
 
     /**
      * Service worker entry point.
      */
-    static run() {
-      self.addEventListener('activate', OSServiceWorker.onServiceWorkerActivated);
-      self.addEventListener('push', OSServiceWorker.onPushReceived);
-      self.addEventListener('notificationclose', OSServiceWorker.onNotificationClosed);
-      self.addEventListener('notificationclick', event => event.waitUntil(OSServiceWorker.onNotificationClicked(event)));
+    run: function(): void {
+      // Now, absent `class` semantics, we can see locally: `this === self`
+      self.addEventListener('activate', this.onServiceWorkerActivated);
+      self.addEventListener('push', this.onPushReceived);
+      self.addEventListener('notificationclose', this.onNotificationClosed);
+      self.addEventListener('notificationclick', event => event.waitUntil(this.onNotificationClicked(event)));
       self.addEventListener('pushsubscriptionchange', (event: PushSubscriptionChangeEvent) => {
-        event.waitUntil(OSServiceWorker.onPushSubscriptionChange(event));
+        event.waitUntil(this.onPushSubscriptionChange(event));
       });
-
 
       self.addEventListener('message', (event: ExtendableMessageEvent) => {
         const data: WorkerMessengerMessage = event.data;
@@ -175,11 +162,11 @@ const definitionInjecting = () : any => {
         switch(data.command) {
           case WorkerMessengerCommand.SessionUpsert:
             Log.debug("[Service Worker] Received SessionUpsert", payload);
-            OSServiceWorker.debounceRefreshSession(event, payload as UpsertSessionPayload);
+            this.debounceRefreshSession(event, payload as UpsertSessionPayload);
             break;
           case WorkerMessengerCommand.SessionDeactivate:
             Log.debug("[Service Worker] Received SessionDeactivate", payload);
-            OSServiceWorker.debounceRefreshSession(event, payload as DeactivateSessionPayload);
+            this.debounceRefreshSession(event, payload as DeactivateSessionPayload);
             break;
           default:
             return;
@@ -200,12 +187,12 @@ const definitionInjecting = () : any => {
       */
       Log.debug('Setting up message listeners.');
       // self.addEventListener('message') is statically added inside the listen() method
-      OSServiceWorker.workerMessenger.listen();
+      this.workerMessenger.listen();
       // Install messaging event handlers for page <-> service worker communication
-      OSServiceWorker.setupMessageListeners();
-    }
+      this.setupMessageListeners();
+    },
 
-    static async getAppId(): Promise<string> {
+    getAppId: async function(): Promise<string> {
       if (self.location.search) {
         const match = self.location.search.match(/appId=([0-9a-z-]+)&?/i);
         // Successful regex matches are at position 1
@@ -216,60 +203,60 @@ const definitionInjecting = () : any => {
       }
       const { appId } = await Database.getAppConfig();
       return appId;
-    }
+    },
 
-    static setupMessageListeners() {
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.WorkerVersion, _ => {
+    setupMessageListeners: function(): void {
+      workerMessenger.on(WorkerMessengerCommand.WorkerVersion, (_: any) => {
         Log.debug('[Service Worker] Received worker version message.');
-        OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.WorkerVersion, Environment.version());
+        workerMessenger.broadcast(WorkerMessengerCommand.WorkerVersion, Environment.version());
       });
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.Subscribe, async (appConfigBundle: any) => {
+      workerMessenger.on(WorkerMessengerCommand.Subscribe, async (appConfigBundle: any) => {
         const appConfig = appConfigBundle;
         Log.debug('[Service Worker] Received subscribe message.');
         const context = new ContextSW(appConfig);
         const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
         const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
-        OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.Subscribe, subscription.serialize());
+        workerMessenger.broadcast(WorkerMessengerCommand.Subscribe, subscription.serialize());
       });
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.SubscribeNew, async (appConfigBundle: any) => {
+      workerMessenger.on(WorkerMessengerCommand.SubscribeNew, async (appConfigBundle: any) => {
         const appConfig = appConfigBundle;
         Log.debug('[Service Worker] Received subscribe new message.');
         const context = new ContextSW(appConfig);
         const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.SubscribeNew);
         const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
-        OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.SubscribeNew, subscription.serialize());
+        workerMessenger.broadcast(WorkerMessengerCommand.SubscribeNew, subscription.serialize());
       });
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.AmpSubscriptionState, async (_appConfigBundle: any) => {
+      workerMessenger.on(WorkerMessengerCommand.AmpSubscriptionState, async (_appConfigBundle: any) => {
         Log.debug('[Service Worker] Received AMP subscription state message.');
         const pushSubscription = await self.registration.pushManager.getSubscription();
         if (!pushSubscription) {
-          await OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, false);
+          await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, false);
         } else {
           const permission = await self.registration.pushManager.permissionState(pushSubscription.options);
           const { optedOut } = await Database.getSubscription();
           const isSubscribed = !!pushSubscription && permission === "granted" && optedOut !== true;
-          await OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, isSubscribed);
+          await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, isSubscribed);
         }
       });
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.AmpSubscribe, async () => {
+      workerMessenger.on(WorkerMessengerCommand.AmpSubscribe, async () => {
         Log.debug('[Service Worker] Received AMP subscribe message.');
-        const appId = await OSServiceWorker.getAppId();
+        const appId = await this.getAppId();
         const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
         const context = new ContextSW(appConfig);
         const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
         const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
         await Database.put('Ids', { type: 'appId', id: appId });
-        OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscribe, subscription.deviceId);
+        workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscribe, subscription.deviceId);
       });
-      OSServiceWorker.workerMessenger.on(WorkerMessengerCommand.AmpUnsubscribe, async () => {
+      workerMessenger.on(WorkerMessengerCommand.AmpUnsubscribe, async () => {
         Log.debug('[Service Worker] Received AMP unsubscribe message.');
-        const appId = await OSServiceWorker.getAppId();
+        const appId = await this.getAppId();
         const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
         const context = new ContextSW(appConfig);
         await context.subscriptionManager.unsubscribe(UnsubscriptionStrategy.MarkUnsubscribed);
-        OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.AmpUnsubscribe, null);
+        workerMessenger.broadcast(WorkerMessengerCommand.AmpUnsubscribe, null);
       });
-      OSServiceWorker.workerMessenger.on(
+      workerMessenger.on(
         WorkerMessengerCommand.AreYouVisibleResponse, async (payload: PageVisibilityResponse) => {
           Log.debug('[Service Worker] Received response for AreYouVisible', payload);
           if (!self.clientsStatus) { return; }
@@ -283,7 +270,7 @@ const definitionInjecting = () : any => {
           }
         }
       );
-      OSServiceWorker.workerMessenger.on(
+      workerMessenger.on(
         WorkerMessengerCommand.SetLogging, async (payload: {shouldLog: boolean}) => {
           if (payload.shouldLog) {
             self.shouldLog = true;
@@ -292,27 +279,27 @@ const definitionInjecting = () : any => {
           }
         }
       );
-    }
+    },
 
     /**
      * Occurs when a push message is received.
      * This method handles the receipt of a push signal on all web browsers except Safari, which uses the OS to handle
      * notifications.
      */
-    static onPushReceived(event: PushEvent): void {
+    onPushReceived: function(event: PushEvent): void {
       Log.debug(`Called %conPushReceived(${JSON.stringify(event, null, 4)}):`, Utils.getConsoleStyle('code'), event);
 
       event.waitUntil(
-          OSServiceWorker.parseOrFetchNotifications(event)
+          this.parseOrFetchNotifications(event)
               .then(async (notifications: any) => {
                 //Display push notifications in the order we received them
                 const notificationEventPromiseFns = [];
                 const notificationReceivedPromises: Promise<void>[] = [];
-                const appId = await OSServiceWorker.getAppId();
+                const appId = await this.getAppId();
 
                 for (const rawNotification of notifications) {
                   Log.debug('Raw Notification from OneSignal:', rawNotification);
-                  const notification = OSServiceWorker.buildStructuredNotificationObject(rawNotification);
+                  const notification = this.buildStructuredNotificationObject(rawNotification);
 
                   const notificationReceived: NotificationReceived = {
                     notificationId: notification.id,
@@ -325,13 +312,13 @@ const definitionInjecting = () : any => {
                   // Probably should have it's own error handling but not blocking the rest of the execution?
 
                   // Never nest the following line in a callback from the point of entering from retrieveNotifications
-                  notificationEventPromiseFns.push((notif => {
-                    return OSServiceWorker.displayNotification(notif)
-                        .then(() => {
-                          return OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.NotificationDisplayed, notif).catch(e => Log.error(e));
+                  notificationEventPromiseFns.push((async (notif: any) => {
+                    return this.displayNotification(notif)
+                        .then(async () => {
+                          return this.workerMessenger.broadcast(WorkerMessengerCommand.NotificationDisplayed, notif).catch(e => Log.error(e));
                         })
-                        .then(() => OSServiceWorker.executeWebhooks('notification.displayed', notif)
-                        .then(() => OSServiceWorker.sendConfirmedDelivery(notif)).catch(e => Log.error(e)));
+                        .then(() => this.executeWebhooks('notification.displayed', notif)
+                        .then(() => this.sendConfirmedDelivery(notif)).catch(e => Log.error(e)));
                   }).bind(null, notification));
                 }
 
@@ -341,13 +328,13 @@ const definitionInjecting = () : any => {
               })
               .catch(e => {
                 Log.debug('Failed to display a notification:', e);
-                if (OSServiceWorker.UNSUBSCRIBED_FROM_NOTIFICATIONS) {
+                if (this.UNSUBSCRIBED_FROM_NOTIFICATIONS) {
                   Log.debug('Because we have just unsubscribed from notifications, we will not show anything.');
-                  return undefined;
                 }
+                return undefined;
               })
       );
-    }
+    },
 
     /**
      * Makes a POST call to a specified URL to forward certain events.
@@ -356,7 +343,7 @@ const definitionInjecting = () : any => {
      * @param notification A JSON object containing notification details the user consumes.
      * @returns {Promise}
      */
-    static async executeWebhooks(event: string, notification: any): Promise<Response | null> {
+    executeWebhooks: async function(event: string, notification: any): Promise<Response | null> {
       const webhookTargetUrl = await Database.get<string>('Options', `webhooks.${event}`);
       if (!webhookTargetUrl)
         return null;
@@ -396,14 +383,14 @@ const definitionInjecting = () : any => {
         Utils.getConsoleStyle('code'), ':', postData
       );
       return await fetch(webhookTargetUrl, fetchOptions);
-    }
+    },
 
     /**
      * Makes a PUT call to log the delivery of the notification
      * @param notification A JSON object containing notification details.
      * @returns {Promise}
      */
-    static async sendConfirmedDelivery(notification: any): Promise<Response | null> {
+    sendConfirmedDelivery: async function(notification: any): Promise<Response | null> {
       if (!notification)
         return null;
 
@@ -411,7 +398,7 @@ const definitionInjecting = () : any => {
       if (notification.rr !== "y")
         return null;
 
-      const appId = await OSServiceWorker.getAppId();
+      const appId = await this.getAppId();
       const { deviceId } = await Database.getSubscription();
 
       // app and notification ids are required, decided to exclude deviceId from required params
@@ -435,7 +422,7 @@ const definitionInjecting = () : any => {
 
       await awaitableTimeout(Math.floor(Math.random() * MAX_CONFIRMED_DELIVERY_DELAY * 1_000));
       return await OneSignalApiBase.put(`notifications/${notification.id}/report_received`, postData);
-    }
+    },
 
     /**
      * Gets an array of active window clients along with whether each window client is the HTTP site's iFrame or an
@@ -445,7 +432,7 @@ const definitionInjecting = () : any => {
      * and not both. This doesn't really matter though.
      * @returns {Promise}
      */
-    static async getActiveClients(): Promise<Array<OSWindowClient>> {
+    getActiveClients: async function(): Promise<Array<OSWindowClient>> {
       const windowClients: ReadonlyArray<Client> = await self.clients.matchAll({
         type: 'window',
         includeUncontrolled: true
@@ -468,12 +455,12 @@ const definitionInjecting = () : any => {
         activeClients.push(windowClient);
       }
       return activeClients;
-    }
+    },
 
-    static async updateSessionBasedOnHasActive(
+    updateSessionBasedOnHasActive: async function(
       event: ExtendableMessageEvent,
       hasAnyActiveSessions: boolean, options: DeactivateSessionPayload
-    ) {
+    ): Promise<void> {
       if (hasAnyActiveSessions) {
         await ServiceWorkerHelper.upsertSession(
           options.sessionThreshold,
@@ -492,9 +479,9 @@ const definitionInjecting = () : any => {
           event.waitUntil(cancelableFinalize.promise);
         }
       }
-    }
+    },
 
-    static async refreshSession(event: ExtendableMessageEvent, options: DeactivateSessionPayload): Promise<void> {
+    refreshSession: async function(event: ExtendableMessageEvent, options: DeactivateSessionPayload): Promise<void> {
       Log.debug("[Service Worker] refreshSession");
       /**
        * if https -> getActiveClients -> check for the first focused
@@ -510,20 +497,20 @@ const definitionInjecting = () : any => {
         );
 
         if (options.isSafari) {
-          await OSServiceWorker.checkIfAnyClientsFocusedAndUpdateSession(event, windowClients, options);
+          await this.checkIfAnyClientsFocusedAndUpdateSession(event, windowClients, options);
         } else {
           const hasAnyActiveSessions: boolean = windowClients.some(w => (w as WindowClient).focused);
           Log.debug("[Service Worker] isHttps hasAnyActiveSessions", hasAnyActiveSessions);
-          await OSServiceWorker.updateSessionBasedOnHasActive(event, hasAnyActiveSessions, options);
+          await this.updateSessionBasedOnHasActive(event, hasAnyActiveSessions, options);
         }
         return;
       } else {
-        const osClients = await OSServiceWorker.getActiveClients();
-        await OSServiceWorker.checkIfAnyClientsFocusedAndUpdateSession(event, osClients, options);
+        const osClients = await this.getActiveClients();
+        await this.checkIfAnyClientsFocusedAndUpdateSession(event, osClients, options);
       }
-    }
+    },
 
-    static async checkIfAnyClientsFocusedAndUpdateSession(
+    checkIfAnyClientsFocusedAndUpdateSession: async function(
       event: ExtendableMessageEvent,
       windowClients: ReadonlyArray<Client>,
       sessionInfo: DeactivateSessionPayload
@@ -548,16 +535,16 @@ const definitionInjecting = () : any => {
         if (self.clientsStatus.timestamp !== timestamp) { return; }
 
         Log.debug("updateSessionBasedOnHasActive", self.clientsStatus);
-        await OSServiceWorker.updateSessionBasedOnHasActive(event,
+        await this.updateSessionBasedOnHasActive(event,
           self.clientsStatus.hasAnyActiveSessions, sessionInfo);
         self.clientsStatus = undefined;
       };
       const getClientStatusesCancelable = cancelableTimeout(updateOnHasActive, 0.5);
       self.cancel = getClientStatusesCancelable.cancel;
       event.waitUntil(getClientStatusesCancelable.promise);
-    }
+    },
 
-    static debounceRefreshSession(event: ExtendableMessageEvent, options: DeactivateSessionPayload) {
+    debounceRefreshSession: function(event: ExtendableMessageEvent, options: DeactivateSessionPayload) {
       Log.debug("[Service Worker] debounceRefreshSession", options);
 
       if (self.cancel) {
@@ -566,13 +553,13 @@ const definitionInjecting = () : any => {
       }
 
       const executeRefreshSession = async () => {
-        await OSServiceWorker.refreshSession(event, options);
+        await this.refreshSession(event, options);
       };
 
       const cancelableRefreshSession = cancelableTimeout(executeRefreshSession, 1);
       self.cancel = cancelableRefreshSession.cancel;
       event.waitUntil(cancelableRefreshSession.promise);
-    }
+    },
 
     /**
      * Constructs a structured notification object from the raw notification fetched from OneSignal's server. This
@@ -580,7 +567,7 @@ const definitionInjecting = () : any => {
      * Constructed in onPushReceived, and passed along to other event handlers.
      * @param rawNotification The raw notification JSON returned from OneSignal's server.
      */
-    static buildStructuredNotificationObject(rawNotification) {
+    buildStructuredNotificationObject: function(rawNotification) {
       const notification: any = {
         id: rawNotification.custom.i,
         heading: rawNotification.title,
@@ -608,7 +595,7 @@ const definitionInjecting = () : any => {
         }
       }
       return Utils.trimUndefined(notification);
-    }
+    },
 
     /**
      * Given an image URL, returns a proxied HTTPS image using the https://images.weserv.nl service.
@@ -616,7 +603,7 @@ const definitionInjecting = () : any => {
      * If the image protocol is HTTPS, or origin contains localhost or starts with 192.168.*.*, we do not proxy the image.
      * @param imageUrl An HTTP or HTTPS image URL.
      */
-    static ensureImageResourceHttps(imageUrl) {
+    ensureImageResourceHttps: function(imageUrl: string): string | null {
       if (imageUrl) {
         try {
           const parsedImageUrl = new URL(imageUrl);
@@ -636,47 +623,47 @@ const definitionInjecting = () : any => {
           /* HTTPS origin hosts can be used by prefixing the hostname with ssl: */
           const replacedImageUrl = parsedImageUrl.host + parsedImageUrl.pathname;
           return `https://i0.wp.com/${replacedImageUrl}`;
-        } catch (e) { }
+        } catch (e) { return null; }
       } else return null;
-    }
+    },
 
     /**
      * Given a structured notification object, HTTPS-ifies the notification icons and action button icons, if they exist.
      */
-    static ensureNotificationResourcesHttps(notification) {
+    ensureNotificationResourcesHttps: function(notification): void {
       if (notification) {
         if (notification.icon) {
-          notification.icon = OSServiceWorker.ensureImageResourceHttps(notification.icon);
+          notification.icon = this.ensureImageResourceHttps(notification.icon);
         }
         if (notification.image) {
-          notification.image = OSServiceWorker.ensureImageResourceHttps(notification.image);
+          notification.image = this.ensureImageResourceHttps(notification.image);
         }
         if (notification.buttons && notification.buttons.length > 0) {
           for (const button of notification.buttons) {
             if (button.icon) {
-              button.icon = OSServiceWorker.ensureImageResourceHttps(button.icon);
+              button.icon = this.ensureImageResourceHttps(button.icon);
             }
           }
         }
       }
-    }
+    },
 
     /**
      * Actually displays a visible notification to the user.
      * Any event needing to display a notification calls this so that all the display options can be centralized here.
      * @param notification A structured notification object.
      */
-    static async displayNotification(notification, overrides?) {
+    displayNotification: async function(notification: any, overrides?: any): Promise<void> {
       Log.debug(`Called %cdisplayNotification(${JSON.stringify(notification, null, 4)}):`, Utils.getConsoleStyle('code'), notification);
 
       // Use the default title if one isn't provided
-      const defaultTitle = await OSServiceWorker._getTitle();
+      const defaultTitle = await this._getTitle() as string;
       // Use the default icon if one isn't provided
       const defaultIcon = await Database.get('Options', 'defaultIcon');
       // Get option of whether we should leave notification displaying indefinitely
       const persistNotification = await Database.get('Options', 'persistNotification');
       // Get app ID for tag value
-      const appId = await OSServiceWorker.getAppId();
+      const appId = await this.getAppId();
 
       notification.heading = notification.heading ? notification.heading : defaultTitle;
       notification.icon = notification.icon ? notification.icon : (defaultIcon ? defaultIcon : undefined);
@@ -690,7 +677,7 @@ const definitionInjecting = () : any => {
         overrides = {};
       notification = { ...notification, ...overrides };
 
-      OSServiceWorker.ensureNotificationResourcesHttps(notification);
+      this.ensureNotificationResourcesHttps(notification);
 
       const notificationOptions = {
         body: notification.content,
@@ -758,38 +745,38 @@ const definitionInjecting = () : any => {
       };
 
       return self.registration.showNotification(notification.heading, notificationOptions);
-    }
+    },
 
     /**
      * Returns false if the given URL matches a few special URLs designed to skip opening a URL when clicking a
      * notification. Otherwise returns true and the link will be opened.
      * @param url
        */
-    static shouldOpenNotificationUrl(url) {
+    shouldOpenNotificationUrl: function(url: string): boolean {
       return (url !== 'javascript:void(0);' &&
               url !== 'do_not_open' &&
               !Utils.contains(url, '_osp=do_not_open'));
-    }
+    },
 
     /**
      * Occurs when a notification is dismissed by the user (clicking the 'X') or all notifications are cleared.
      * Supported on: Chrome 50+ only
      */
-    static onNotificationClosed(event) {
+    onNotificationClosed: function(event: any): void {
       Log.debug(`Called %conNotificationClosed(${JSON.stringify(event, null, 4)}):`, Utils.getConsoleStyle('code'), event);
       const notification = event.notification.data;
 
-      OSServiceWorker.workerMessenger.broadcast(WorkerMessengerCommand.NotificationDismissed, notification).catch(e => Log.error(e));
+      this.workerMessenger.broadcast(WorkerMessengerCommand.NotificationDismissed, notification).catch(e => Log.error(e));
       event.waitUntil(
-          OSServiceWorker.executeWebhooks('notification.dismissed', notification)
+          this.executeWebhooks('notification.dismissed', notification)
       );
-    }
+    },
 
     /**
      * After clicking a notification, determines the URL to open based on whether an action button was clicked or the
      * notification body was clicked.
      */
-    static async getNotificationUrlToOpen(notification): Promise<string> {
+    getNotificationUrlToOpen: async function(notification: any): Promise<string> {
       // Defaults to the URL the service worker was registered
       // TODO: This should be fixed for HTTP sites
       let launchUrl = location.origin;
@@ -817,13 +804,13 @@ const definitionInjecting = () : any => {
       }
 
       return launchUrl;
-    }
+    },
 
     /**
      * Occurs when the notification's body or action buttons are clicked. Does not occur if the notification is
      * dismissed by clicking the 'X' icon. See the notification close event for the dismissal event.
      */
-    static async onNotificationClicked(event: NotificationEventInit) {
+    onNotificationClicked: async function(event: NotificationEventInit): Promise<void> {
       Log.debug(`Called %conNotificationClicked(${JSON.stringify(event, null, 4)}):`, Utils.getConsoleStyle('code'), event);
 
       // Close the notification first here, before we do anything that might fail
@@ -842,13 +829,14 @@ const definitionInjecting = () : any => {
       if (matchPreference)
         notificationClickHandlerMatch = matchPreference;
 
-      const actionPreference = await this.database.get<string>('Options', 'notificationClickHandlerAction');
+      // NB: `this.database` is `Partial<Database`: assuming it has `get`.
+      const actionPreference = await (this.database as Database).get<string>('Options', 'notificationClickHandlerAction');
       if (actionPreference)
         notificationClickHandlerAction = actionPreference;
 
-      const launchUrl: string = await OSServiceWorker.getNotificationUrlToOpen(notificationData);
-      const notificationOpensLink: boolean = OSServiceWorker.shouldOpenNotificationUrl(launchUrl);
-      const appId = await OSServiceWorker.getAppId();
+      const launchUrl: string = await this.getNotificationUrlToOpen(notificationData);
+      const notificationOpensLink: boolean = this.shouldOpenNotificationUrl(launchUrl);
+      const appId = await this.getAppId();
       const deviceType = DeviceRecord.prototype.getDeliveryPlatform();
 
       let saveNotificationClickedPromise: Promise<void> | undefined;
@@ -881,7 +869,7 @@ const definitionInjecting = () : any => {
       // Start making REST API requests BEFORE self.clients.openWindow is called.
       // It will cause the service worker to stop on Chrome for Android when site is added to the home screen.
       const { deviceId } = await Database.getSubscription();
-      const convertedAPIRequests = OSServiceWorker.sendConvertedAPIRequests(appId, deviceId, notificationData, deviceType);
+      const convertedAPIRequests = this.sendConvertedAPIRequests(appId, deviceId, notificationData, deviceType);
 
       /*
        Check if we can focus on an existing tab instead of opening a new url.
@@ -889,7 +877,7 @@ const definitionInjecting = () : any => {
        an identical new tab being created. With a special setting, any existing tab matching the origin will
        be focused instead of an identical new tab being created.
        */
-      const activeClients = await OSServiceWorker.getActiveClients();
+      const activeClients = await this.getActiveClients();
       let doNotOpenLink = false;
       for (const client of activeClients) {
         let clientUrl = client.url;
@@ -920,7 +908,7 @@ const definitionInjecting = () : any => {
           if ((client['isSubdomainIframe'] && clientUrl === launchUrl) ||
               (!client['isSubdomainIframe'] && client.url === launchUrl) ||
             (notificationClickHandlerAction === 'focus' && clientOrigin === launchOrigin)) {
-            OSServiceWorker.workerMessenger.unicast(WorkerMessengerCommand.NotificationClicked, notificationData, client);
+            this.workerMessenger.unicast(WorkerMessengerCommand.NotificationClicked, notificationData, client);
               try {
                 if (client instanceof WindowClient)
                   await client.focus();
@@ -945,7 +933,7 @@ const definitionInjecting = () : any => {
               if (notificationOpensLink) {
                 Log.debug(`Redirecting HTTP site to ${launchUrl}.`);
                 await Database.put("NotificationOpened", { url: launchUrl, data: notificationData, timestamp: Date.now() });
-                OSServiceWorker.workerMessenger.unicast(WorkerMessengerCommand.RedirectPage, launchUrl, client);
+                this.workerMessenger.unicast(WorkerMessengerCommand.RedirectPage, launchUrl, client);
               } else {
                 Log.debug('Not navigating because link is special.');
               }
@@ -972,7 +960,7 @@ const definitionInjecting = () : any => {
             } else {
               // If client.navigate() isn't available, we have no other option but to open a new tab to the URL.
               await Database.put("NotificationOpened", { url: launchUrl, data: notificationData, timestamp: Date.now() });
-              await OSServiceWorker.openUrl(launchUrl);
+              await this.openUrl(launchUrl);
             }
           }
           doNotOpenLink = true;
@@ -982,21 +970,21 @@ const definitionInjecting = () : any => {
 
       if (notificationOpensLink && !doNotOpenLink) {
         await Database.put("NotificationOpened", { url: launchUrl, data: notificationData, timestamp: Date.now() });
-        await OSServiceWorker.openUrl(launchUrl);
+        await this.openUrl(launchUrl);
       }
       if (saveNotificationClickedPromise) {
         await saveNotificationClickedPromise;
       }
 
       return await convertedAPIRequests;
-    }
+    },
 
     /**
      * Makes network calls for the notification open event to;
      *    1. OneSignal.com to increase the notification open count.
      *    2. A website developer defined webhook URL, if set.
      */
-    static async sendConvertedAPIRequests(
+    sendConvertedAPIRequests: async function(
       appId: string | undefined | null,
       deviceId: string | undefined,
       notificationData: any,
@@ -1020,16 +1008,16 @@ const definitionInjecting = () : any => {
       else
         console.error("No app Id, skipping OneSignal API call for notification open!");
 
-      await OSServiceWorker.executeWebhooks('notification.clicked', notificationData);
+      await this.executeWebhooks('notification.clicked', notificationData);
       if (onesignalRestPromise)
         await onesignalRestPromise;
-    }
+    },
 
     /**
      * Attempts to open the given url in a new browser tab. Called when a notification is clicked.
      * @param url May not be well-formed.
      */
-    static async openUrl(url: string): Promise<Client | null> {
+    openUrl: async function(url: string): Promise<Client | null> {
       Log.debug('Opening notification URL:', url);
       try {
         return await self.clients.openWindow(url);
@@ -1037,7 +1025,7 @@ const definitionInjecting = () : any => {
         Log.warn(`Failed to open the URL '${url}':`, e);
         return null;
       }
-    }
+    },
 
     /**
      * Fires when the ServiceWorker can control pages.
@@ -1048,15 +1036,15 @@ const definitionInjecting = () : any => {
      *      right after accepting the notification permission from the pop-up.
      * @param event
      */
-    static onServiceWorkerActivated(event: ExtendableEvent) {
+    onServiceWorkerActivated: function(event: ExtendableEvent): void {
       Log.info(`OneSignal Service Worker activated (version ${Environment.version()})`);
       event.waitUntil(self.clients.claim());
-    }
+    },
 
-    static async onPushSubscriptionChange(event: PushSubscriptionChangeEvent) {
+    onPushSubscriptionChange: async function(event: PushSubscriptionChangeEvent): Promise<void> {
       Log.debug(`Called %conPushSubscriptionChange(${JSON.stringify(event, null, 4)}):`, Utils.getConsoleStyle('code'), event);
 
-      const appId = await OSServiceWorker.getAppId();
+      const appId = await this.getAppId();
       if (!appId) {
         // Without an app ID, we can't make any calls
         return;
@@ -1090,7 +1078,7 @@ const definitionInjecting = () : any => {
       }
 
       // Get our new push subscription
-      let rawPushSubscription: RawPushSubscription;
+      let rawPushSubscription: RawPushSubscription | null;
 
       // Set it initially by the provided new push subscription
       const providedNewSubscription = event.newSubscription;
@@ -1101,7 +1089,7 @@ const definitionInjecting = () : any => {
         try {
           rawPushSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.SubscribeNew);
         } catch (e) {
-          // Let rawPushSubscription be null
+          rawPushSubscription = null;
         }
       }
       const hasNewSubscription = !!rawPushSubscription;
@@ -1130,16 +1118,17 @@ const definitionInjecting = () : any => {
 
         // rawPushSubscription may be null if no push subscription was retrieved
         await context.subscriptionManager.registerSubscription(
-          rawPushSubscription,
-          subscriptionState
+          // FIXME: tighten contract types in `registerSubscription`
+          rawPushSubscription!,
+          subscriptionState!
         );
       }
-    }
+    },
 
     /**
      * Returns a promise that is fulfilled with either the default title from the database (first priority) or the page title from the database (alternate result).
      */
-    static _getTitle() {
+    _getTitle: function(): Promise<unknown> {
       return new Promise(resolve => {
         Promise.all([Database.get('Options', 'defaultTitle'), Database.get('Options', 'pageTitle')])
           .then(([defaultTitle, pageTitle]) => {
@@ -1154,7 +1143,7 @@ const definitionInjecting = () : any => {
             }
           });
       });
-    }
+    },
 
     /**
      * Returns an array of raw notification objects, read from the event.data.payload property
@@ -1162,12 +1151,12 @@ const definitionInjecting = () : any => {
      * @returns An array of notifications. The new web push protocol will only ever contain one notification, however
      * an array is returned for backwards compatibility with the rest of the service worker plumbing.
        */
-    static parseOrFetchNotifications(event) {
+    parseOrFetchNotifications: function(event: any): Promise<Array<string>> {
       if (!event || !event.data) {
         return Promise.reject("Missing event.data on push payload!");
       }
 
-      const isValidPayload = OSServiceWorker.isValidPushPayload(event.data);
+      const isValidPayload = this.isValidPushPayload(event.data);
       if (isValidPayload) {
         Log.debug("Received a valid encrypted push payload.");
         return Promise.resolve([event.data.json()]);
@@ -1178,14 +1167,14 @@ const definitionInjecting = () : any => {
        payload. The last received notification will be displayed.
       */
       return Promise.reject(`Unexpected push message payload received: ${event.data}`);
-    }
+    },
 
     /**
      * Returns true if the raw data payload is a OneSignal push message in the format of the new web push protocol.
      * Otherwise returns false.
      * @param rawData The raw PushMessageData from the push event's event.data, not already parsed to JSON.
      */
-    static isValidPushPayload(rawData) {
+    isValidPushPayload: function(rawData: any): boolean {
       try {
         const payload = rawData.json();
         if (payload &&
@@ -1203,21 +1192,31 @@ const definitionInjecting = () : any => {
       }
     }
   }
-
-  return OSServiceWorker;
 }
 
-export const ServiceWorker = definitionInjecting()
+let sw: OSServiceWorker;
 
-// Expose this class to the global scope
+// Externalizing global state dep from mkServiceWorker, still works same.
 if (typeof self === "undefined" &&
     typeof global !== "undefined") {
-  (global as any).OneSignalWorker = ServiceWorker;
+  sw = mkServiceWorker({});
+  (global as any).OneSignalWorker = sw;
 } else {
-  (self as any).OneSignalWorker = ServiceWorker;
+  let workerMessenger: WorkerMessenger | undefined;
+
+  // Honor someone else's global state grab if they got there first.
+  if (!(self as any).workerMessenger) {
+    // FIXME: WorkerMessenger implementation is not coded defensively for
+    //        empty object `context`. Expect problems.
+    workerMessenger = new WorkerMessenger(({} as ContextSWInterface)!);
+  }
+
+  const options = { workerMessenger }
+
+  sw = mkServiceWorker(options);
+  (self as any).OneSignalWorker = sw;
+
+  sw.run();
 }
 
-// Run our main file
-if (typeof self !== "undefined") {
-  ServiceWorker.run();
-}
+export const ServiceWorker = sw
