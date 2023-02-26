@@ -1,4 +1,4 @@
-import bowser from "bowser";
+import bowser, { IBowser } from "bowser";
 
 import Environment from "../Environment";
 import { WorkerMessenger, WorkerMessengerCommand, WorkerMessengerMessage } from "../libraries/WorkerMessenger";
@@ -43,6 +43,57 @@ const MAX_CONFIRMED_DELIVERY_DELAY = 25;
 //
 // Step 1: copy/paste definition of class into a context that's programmatically
 //         alterable; change only class name to stop shadowing `ServiceWorker`.
+// Step 2: extract an interface for `OSServiceWorker` implementation details;
+//         put that aside, make `OSServiceWorker` explicitly `any`-- it has
+//         nothing to do with ts-lib-provided `ServiceWorker` interface.
+interface OSServiceWorkerImplementationDetails {
+  UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
+  VERSION: number;
+  environment: Environment;
+  log: Log;
+  database: Partial<Database>; // `Partial` discovered during conforming
+  browser: IBowser;
+  workerMessenger: WorkerMessenger;
+  run(): void;
+  getAppId(): Promise<string>;
+  setupMessageListeners(): void;
+  onPushReceived(event: PushEvent): void;
+  executeWebhooks(event: string, notification: any): Promise<Response | null>;
+  sendConfirmedDelivery(notification: any): Promise<Response | null>;
+  getActiveClients(): Promise<Array<OSWindowClient>>;
+  updateSessionBasedOnHasActive(
+    event: ExtendableMessageEvent,
+    hasAnyActiveSessions: boolean, options: DeactivateSessionPayload
+  ): Promise<void>;
+  refreshSession(event: ExtendableMessageEvent, options: DeactivateSessionPayload): Promise<void>;
+  checkIfAnyClientsFocusedAndUpdateSession(
+    event: ExtendableMessageEvent,
+    windowClients: ReadonlyArray<Client>,
+    sessionInfo: DeactivateSessionPayload
+  ): Promise<void>;
+  debounceRefreshSession(event: ExtendableMessageEvent, options: DeactivateSessionPayload): void;
+  buildStructuredNotificationObject(rawNotification: any): any;
+  ensureImageResourceHttps(imageUrl: string): string | null;
+  ensureNotificationResourcesHttps(notification: any): void;
+  displayNotification(notification: any, overrides?: any): Promise<void>;
+  shouldOpenNotificationUrl(url: string): boolean;
+  onNotificationClosed(event: Event): void;
+  getNotificationUrlToOpen(notification: any): Promise<string>;
+  onNotificationClicked(event: NotificationEventInit): Promise<void>;
+  sendConvertedAPIRequests(
+    appId: string | undefined | null,
+    deviceId: string | undefined,
+    notificationData: any,
+    deviceType: number
+  ): Promise<void>;
+  openUrl(url: string): Promise<Client | null>;
+  onServiceWorkerActivated(event: ExtendableEvent): void;
+  onPushSubscriptionChange(event: PushSubscriptionChangeEvent): Promise<void>;
+  _getTitle(): Promise<unknown>;
+  parseOrFetchNotifications(event: any): Promise<Array<any>>;
+  isValidPushPayload(rawData: any): boolean;
+}
+
 const definitionInjecting = () : any => {
   /**
    * The main service worker script fetching and displaying notifications to users in the background even when the client
@@ -52,7 +103,7 @@ const definitionInjecting = () : any => {
    * For HTTPS sites, the service worker is registered site-wide at the top-level scope. For HTTP sites, the service
    * worker is registered to the iFrame pointing to subdomain.onesignal.com.
    */
-  class OSServiceWorker {
+  class OSServiceWorker  {
     static UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
 
     /**
