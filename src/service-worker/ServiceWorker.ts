@@ -2,7 +2,7 @@ import bowser, { IBowser } from "bowser";
 
 import Environment from "../Environment";
 import { WorkerMessenger, WorkerMessengerCommand, WorkerMessengerMessage } from "../libraries/WorkerMessenger";
-import ContextSW, { ContextSWInterface } from "../models/ContextSW";
+import ContextSW from "../models/ContextSW";
 import OneSignalApiBase from "../OneSignalApiBase";
 import OneSignalApiSW from "../OneSignalApiSW";
 import Database from "../services/Database";
@@ -46,16 +46,52 @@ const MAX_CONFIRMED_DELIVERY_DELAY = 25;
 //         put that aside, make `OSServiceWorker` explicitly `any`-- it has
 //         nothing to do with ts-lib-provided `ServiceWorker` interface.
 // Step 3: conform to interface, fix most diagnostics
-interface OSServiceWorker {
-  UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
-  VERSION: number;
-  environment: Environment;
-  log: Log;
-  database: Partial<Database>; // `Partial` discovered during conforming
-  browser: IBowser;
+// Step 4: extract event handling into separate interface
+
+// This will take care of itself eventually, but incrementally we need a bucket
+// to put shared relied-upon interfacing for now.
+interface OSServiceWorkerCommon {
   workerMessenger: WorkerMessenger;
-  run(): void;
+  database: Partial<Database>; // `Partial` discovered during conforming
   getAppId(): Promise<string>;
+}
+
+interface FnMkServiceWorkerCommonOptions {
+  workerMessenger: WorkerMessenger
+  database: Partial<Database>
+}
+
+type FnMkServiceWorkerCommon = (options: FnMkServiceWorkerCommonOptions) => OSServiceWorkerCommon
+
+const mkCommon: FnMkServiceWorkerCommon = ({ workerMessenger, database }) => {
+  return {
+    /**
+     * Allows message passing between this service worker and pages on the same domain.
+     * Clients include any HTTPS site page, or the nested iFrame pointing to OneSignal on any HTTP site. This allows
+     * events like notification dismissed, clicked, and displayed to be fired on the clients. It also allows the
+     * clients to communicate with the service worker to close all active notifications.
+     */
+    workerMessenger,
+    database,
+
+    getAppId: async function(): Promise<string> {
+      if (self.location.search) {
+        const match = self.location.search.match(/appId=([0-9a-z-]+)&?/i);
+        // Successful regex matches are at position 1
+        if (match && match.length > 1) {
+          const appId = match[1];
+          return appId;
+        }
+      }
+      const { appId } = await Database.getAppConfig();
+      return appId;
+    },
+  }
+}
+
+interface OSServiceWorkerEventHandlingCore {
+  // This will be cleaned up next commit. Same order for now: restraint.
+  UNSUBSCRIBED_FROM_NOTIFICATIONS: boolean | undefined;
   setupMessageListeners(): void;
   onPushReceived(event: PushEvent): void;
   executeWebhooks(event: string, notification: any): Promise<Response | null>;
@@ -94,116 +130,20 @@ interface OSServiceWorker {
   isValidPushPayload(rawData: any): boolean;
 }
 
-const mkServiceWorker = (options: any) : OSServiceWorker => {
-  /**
-   * The main service worker script fetching and displaying notifications to users in the background even when the client
-   * site is not running. The worker is registered via the navigator.serviceWorker.register() call after the user first
-   * allows notification permissions, and is a pre-requisite to subscribing for push notifications.
-   *
-   * For HTTPS sites, the service worker is registered site-wide at the top-level scope. For HTTP sites, the service
-   * worker is registered to the iFrame pointing to subdomain.onesignal.com.
-   */
-  const workerMessenger = options.workerMessenger;
+interface MkEventHandlingOptions {
+  common: OSServiceWorkerCommon;
+  workerMessenger: WorkerMessenger;
+}
 
+// Composing here lets us reason about `OSServiceWorkerEventHandling` separately.
+type OSServiceWorkerEventHandling = OSServiceWorkerEventHandlingCore & OSServiceWorkerCommon
+type FnMkEventHanding = (options: MkEventHandlingOptions) => OSServiceWorkerEventHandling
+
+const mkEventHandling: FnMkEventHanding = ({ common, workerMessenger }) => {
   return {
+    ...common,
+
     UNSUBSCRIBED_FROM_NOTIFICATIONS: undefined,
-
-    /**
-     * An incrementing integer defined in package.json. Value doesn't matter as long as it's different from the
-     * previous version.
-     */
-    VERSION: Environment.version(),
-
-    /**
-     * Describes what context the JavaScript code is running in and whether we're running in local development mode.
-     */
-    environment: Environment,
-
-    log: Log,
-
-    /**
-     * An interface to the browser's IndexedDB.
-     */
-    database: Database,
-
-    /**
-     * Describes the current browser name and version.
-     */
-    browser: bowser,
-
-    /**
-     * Allows message passing between this service worker and pages on the same domain.
-     * Clients include any HTTPS site page, or the nested iFrame pointing to OneSignal on any HTTP site. This allows
-     * events like notification dismissed, clicked, and displayed to be fired on the clients. It also allows the
-     * clients to communicate with the service worker to close all active notifications.
-     */
-    workerMessenger: workerMessenger,
-
-    /**
-     * Service worker entry point.
-     */
-    run: function(): void {
-      // Now, absent `class` semantics, we can see locally: `this === self`
-      self.addEventListener('activate', this.onServiceWorkerActivated);
-      self.addEventListener('push', this.onPushReceived);
-      self.addEventListener('notificationclose', this.onNotificationClosed);
-      self.addEventListener('notificationclick', event => event.waitUntil(this.onNotificationClicked(event)));
-      self.addEventListener('pushsubscriptionchange', (event: PushSubscriptionChangeEvent) => {
-        event.waitUntil(this.onPushSubscriptionChange(event));
-      });
-
-      self.addEventListener('message', (event: ExtendableMessageEvent) => {
-        const data: WorkerMessengerMessage = event.data;
-        if (!data || !data.command) {
-          return;
-        }
-        const payload = data.payload;
-
-        switch(data.command) {
-          case WorkerMessengerCommand.SessionUpsert:
-            Log.debug("[Service Worker] Received SessionUpsert", payload);
-            this.debounceRefreshSession(event, payload as UpsertSessionPayload);
-            break;
-          case WorkerMessengerCommand.SessionDeactivate:
-            Log.debug("[Service Worker] Received SessionDeactivate", payload);
-            this.debounceRefreshSession(event, payload as DeactivateSessionPayload);
-            break;
-          default:
-            return;
-        }
-      });
-      /*
-        According to
-        https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm:
-
-        "user agents are encouraged to show a warning that the event listeners
-        must be added on the very first evaluation of the worker script."
-
-        We have to register our event handler statically (not within an
-        asynchronous method) so that the browser can optimize not waking up the
-        service worker for events that aren't known for sure to be listened for.
-
-        Also see: https://github.com/w3c/ServiceWorker/issues/1156
-      */
-      Log.debug('Setting up message listeners.');
-      // self.addEventListener('message') is statically added inside the listen() method
-      this.workerMessenger.listen();
-      // Install messaging event handlers for page <-> service worker communication
-      this.setupMessageListeners();
-    },
-
-    getAppId: async function(): Promise<string> {
-      if (self.location.search) {
-        const match = self.location.search.match(/appId=([0-9a-z-]+)&?/i);
-        // Successful regex matches are at position 1
-        if (match && match.length > 1) {
-          const appId = match[1];
-          return appId;
-        }
-      }
-      const { appId } = await Database.getAppConfig();
-      return appId;
-    },
 
     setupMessageListeners: function(): void {
       workerMessenger.on(WorkerMessengerCommand.WorkerVersion, (_: any) => {
@@ -1194,29 +1134,134 @@ const mkServiceWorker = (options: any) : OSServiceWorker => {
   }
 }
 
-let sw: OSServiceWorker;
+interface OSServiceWorkerCore {
+  VERSION: number;
+  environment: Environment;
+  log: Log;
+  browser: IBowser;
+  workerMessenger: WorkerMessenger;
+  run(): void;
+  getAppId(): Promise<string>;
+}
+
+interface MkServiceWorkerOptions {
+  common: OSServiceWorkerCommon;
+  eventHandling: OSServiceWorkerEventHandling;
+}
+
+
+type OSServiceWorker = OSServiceWorkerCore & OSServiceWorkerEventHandling
+type FnMkServiceWorker = (options: MkServiceWorkerOptions) => OSServiceWorker
+
+const mkServiceWorker: FnMkServiceWorker = ({ common, eventHandling }) => {
+  /**
+   * The main service worker script fetching and displaying notifications to users in the background even when the client
+   * site is not running. The worker is registered via the navigator.serviceWorker.register() call after the user first
+   * allows notification permissions, and is a pre-requisite to subscribing for push notifications.
+   *
+   * For HTTPS sites, the service worker is registered site-wide at the top-level scope. For HTTP sites, the service
+   * worker is registered to the iFrame pointing to subdomain.onesignal.com.
+   */
+  return {
+    ...common,
+    ...eventHandling,
+
+    /**
+     * An incrementing integer defined in package.json. Value doesn't matter as long as it's different from the
+     * previous version.
+     */
+    VERSION: Environment.version(),
+
+    /**
+     * Describes what context the JavaScript code is running in and whether we're running in local development mode.
+     */
+    environment: Environment,
+
+    log: Log,
+
+    /**
+     * An interface to the browser's IndexedDB.
+     */
+    database: Database,
+
+    /**
+     * Describes the current browser name and version.
+     */
+    browser: bowser,
+
+    /**
+     * Service worker entry point.
+     */
+    run: function(): void {
+      // Now, absent `class` semantics, we can see locally: `this === self`
+      self.addEventListener('activate', this.onServiceWorkerActivated);
+      self.addEventListener('push', this.onPushReceived);
+      self.addEventListener('notificationclose', this.onNotificationClosed);
+      self.addEventListener('notificationclick', event => event.waitUntil(this.onNotificationClicked(event)));
+      self.addEventListener('pushsubscriptionchange', (event: PushSubscriptionChangeEvent) => {
+        event.waitUntil(this.onPushSubscriptionChange(event));
+      });
+
+      self.addEventListener('message', (event: ExtendableMessageEvent) => {
+        const data: WorkerMessengerMessage = event.data;
+        if (!data || !data.command) {
+          return;
+        }
+        const payload = data.payload;
+
+        switch(data.command) {
+          case WorkerMessengerCommand.SessionUpsert:
+            Log.debug("[Service Worker] Received SessionUpsert", payload);
+            this.debounceRefreshSession(event, payload as UpsertSessionPayload);
+            break;
+          case WorkerMessengerCommand.SessionDeactivate:
+            Log.debug("[Service Worker] Received SessionDeactivate", payload);
+            this.debounceRefreshSession(event, payload as DeactivateSessionPayload);
+            break;
+          default:
+            return;
+        }
+      });
+      /*
+        According to
+        https://w3c.github.io/ServiceWorker/#run-service-worker-algorithm:
+
+        "user agents are encouraged to show a warning that the event listeners
+        must be added on the very first evaluation of the worker script."
+
+        We have to register our event handler statically (not within an
+        asynchronous method) so that the browser can optimize not waking up the
+        service worker for events that aren't known for sure to be listened for.
+
+        Also see: https://github.com/w3c/ServiceWorker/issues/1156
+      */
+      Log.debug('Setting up message listeners.');
+      // self.addEventListener('message') is statically added inside the listen() method
+      workerMessenger.listen();
+      // Install messaging event handlers for page <-> service worker communication
+      this.setupMessageListeners();
+    },
+  }
+}
+
+let workerMessenger: WorkerMessenger;
+
+if (typeof self === "undefined" && typeof global !== "undefined") {
+  workerMessenger = new WorkerMessenger(null!);
+} else {
+  workerMessenger = (self as any).workerMessenger || new WorkerMessenger(null!)
+}
+
+const common = mkCommon({ workerMessenger, database: Database })
+const eventHandling = mkEventHandling({ common, workerMessenger });
+const sw: OSServiceWorker = mkServiceWorker({ common, eventHandling });
+export const ServiceWorker = { ...sw, ...eventHandling }; // compat
 
 // Externalizing global state dep from mkServiceWorker, still works same.
-if (typeof self === "undefined" &&
-    typeof global !== "undefined") {
-  sw = mkServiceWorker({});
-  (global as any).OneSignalWorker = sw;
+if (typeof self === "undefined" && typeof global !== "undefined") {
+  (global as any).OneSignalWorker = ServiceWorker;
 } else {
-  let workerMessenger: WorkerMessenger | undefined;
-
-  // Honor someone else's global state grab if they got there first.
-  if (!(self as any).workerMessenger) {
-    // FIXME: WorkerMessenger implementation is not coded defensively for
-    //        empty object `context`. Expect problems.
-    workerMessenger = new WorkerMessenger(({} as ContextSWInterface)!);
-  }
-
-  const options = { workerMessenger }
-
-  sw = mkServiceWorker(options);
-  (self as any).OneSignalWorker = sw;
-
+  (self as any).OneSignalWorker = ServiceWorker;
   sw.run();
 }
 
-export const ServiceWorker = sw
