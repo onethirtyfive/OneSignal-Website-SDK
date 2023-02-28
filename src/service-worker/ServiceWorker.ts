@@ -47,6 +47,7 @@ const MAX_CONFIRMED_DELIVERY_DELAY = 25;
 //         nothing to do with ts-lib-provided `ServiceWorker` interface.
 // Step 3: conform to interface, fix most diagnostics
 // Step 4: extract event handling into separate interface
+// Step 5: extract message handling from event handling into separate interface
 
 // This will take care of itself eventually, but incrementally we need a bucket
 // to put shared relied-upon interfacing for now.
@@ -85,6 +86,91 @@ const mkCommon: FnMkServiceWorkerCommon = ({ workerMessenger, database }) => {
       }
       const { appId } = await Database.getAppConfig();
       return appId;
+    },
+  }
+}
+
+type OSServiceWorkerMessageHandlers = {
+  [K in WorkerMessengerCommand as string]?: (_: any) => void | Promise<void>
+}
+
+interface FnMkMessageHandlingOptions {
+  common: OSServiceWorkerCommon
+  workerMessenger: WorkerMessenger
+}
+
+type FnMkMessageHandlers = (options: FnMkMessageHandlingOptions) => OSServiceWorkerMessageHandlers
+
+const mkMessageHandlers: FnMkMessageHandlers = ({ common, workerMessenger }) => {
+  return {
+    [WorkerMessengerCommand.WorkerVersion]: function(_: any) {
+      Log.debug('[Service Worker] Received worker version message.');
+      workerMessenger.broadcast(WorkerMessengerCommand.WorkerVersion, Environment.version())
+    },
+    [WorkerMessengerCommand.Subscribe]: async function(appConfigBundle: any) {
+      const appConfig = appConfigBundle;
+      Log.debug('[Service Worker] Received subscribe message.');
+      const context = new ContextSW(appConfig);
+      const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
+      const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
+      workerMessenger.broadcast(WorkerMessengerCommand.Subscribe, subscription.serialize());
+    },
+    [WorkerMessengerCommand.SubscribeNew]: async function(appConfigBundle: any) {
+      const appConfig = appConfigBundle;
+      Log.debug('[Service Worker] Received subscribe new message.');
+      const context = new ContextSW(appConfig);
+      const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.SubscribeNew);
+      const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
+      workerMessenger.broadcast(WorkerMessengerCommand.SubscribeNew, subscription.serialize());
+    },
+    [WorkerMessengerCommand.AmpSubscriptionState]: async function(_appConfigBundle: any) {
+      Log.debug('[Service Worker] Received AMP subscription state message.');
+      const pushSubscription = await self.registration.pushManager.getSubscription();
+      if (!pushSubscription) {
+        await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, false);
+      } else {
+        const permission = await self.registration.pushManager.permissionState(pushSubscription.options);
+        const { optedOut } = await Database.getSubscription();
+        const isSubscribed = !!pushSubscription && permission === "granted" && optedOut !== true;
+        await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, isSubscribed);
+      }
+    },
+    [WorkerMessengerCommand.AmpSubscribe]: async function() {
+      Log.debug('[Service Worker] Received AMP subscribe message.');
+      const appId = await common.getAppId();
+      const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
+      const context = new ContextSW(appConfig);
+      const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
+      const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
+      await Database.put('Ids', { type: 'appId', id: appId });
+      workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscribe, subscription.deviceId);
+    },
+    [WorkerMessengerCommand.AmpUnsubscribe]: async function() {
+      Log.debug('[Service Worker] Received AMP unsubscribe message.');
+      const appId = await common.getAppId();
+      const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
+      const context = new ContextSW(appConfig);
+      await context.subscriptionManager.unsubscribe(UnsubscriptionStrategy.MarkUnsubscribed);
+      workerMessenger.broadcast(WorkerMessengerCommand.AmpUnsubscribe, null);
+    },
+    [WorkerMessengerCommand.AreYouVisibleResponse]: async function(payload: PageVisibilityResponse) {
+      Log.debug('[Service Worker] Received response for AreYouVisible', payload);
+      if (!self.clientsStatus) { return; }
+
+      const timestamp = payload.timestamp;
+      if (self.clientsStatus.timestamp !== timestamp) { return; }
+
+      self.clientsStatus.receivedResponsesCount++;
+      if (payload.focused) {
+        self.clientsStatus.hasAnyActiveSessions = true;
+      }
+    },
+    [WorkerMessengerCommand.SetLogging]: async function(payload: {shouldLog: boolean}) {
+      if (payload.shouldLog) {
+        self.shouldLog = true;
+      } else {
+        self.shouldLog = undefined;
+      }
     },
   }
 }
@@ -133,92 +219,23 @@ interface OSServiceWorkerEventHandlingCore {
 interface MkEventHandlingOptions {
   common: OSServiceWorkerCommon;
   workerMessenger: WorkerMessenger;
+  messageHandlers: OSServiceWorkerMessageHandlers
 }
 
 // Composing here lets us reason about `OSServiceWorkerEventHandling` separately.
 type OSServiceWorkerEventHandling = OSServiceWorkerEventHandlingCore & OSServiceWorkerCommon
 type FnMkEventHanding = (options: MkEventHandlingOptions) => OSServiceWorkerEventHandling
 
-const mkEventHandling: FnMkEventHanding = ({ common, workerMessenger }) => {
+const mkEventHandling: FnMkEventHanding = ({ common, workerMessenger, messageHandlers }) => {
   return {
     ...common,
 
     UNSUBSCRIBED_FROM_NOTIFICATIONS: undefined,
 
     setupMessageListeners: function(): void {
-      workerMessenger.on(WorkerMessengerCommand.WorkerVersion, (_: any) => {
-        Log.debug('[Service Worker] Received worker version message.');
-        workerMessenger.broadcast(WorkerMessengerCommand.WorkerVersion, Environment.version());
-      });
-      workerMessenger.on(WorkerMessengerCommand.Subscribe, async (appConfigBundle: any) => {
-        const appConfig = appConfigBundle;
-        Log.debug('[Service Worker] Received subscribe message.');
-        const context = new ContextSW(appConfig);
-        const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
-        const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
-        workerMessenger.broadcast(WorkerMessengerCommand.Subscribe, subscription.serialize());
-      });
-      workerMessenger.on(WorkerMessengerCommand.SubscribeNew, async (appConfigBundle: any) => {
-        const appConfig = appConfigBundle;
-        Log.debug('[Service Worker] Received subscribe new message.');
-        const context = new ContextSW(appConfig);
-        const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.SubscribeNew);
-        const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
-        workerMessenger.broadcast(WorkerMessengerCommand.SubscribeNew, subscription.serialize());
-      });
-      workerMessenger.on(WorkerMessengerCommand.AmpSubscriptionState, async (_appConfigBundle: any) => {
-        Log.debug('[Service Worker] Received AMP subscription state message.');
-        const pushSubscription = await self.registration.pushManager.getSubscription();
-        if (!pushSubscription) {
-          await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, false);
-        } else {
-          const permission = await self.registration.pushManager.permissionState(pushSubscription.options);
-          const { optedOut } = await Database.getSubscription();
-          const isSubscribed = !!pushSubscription && permission === "granted" && optedOut !== true;
-          await workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscriptionState, isSubscribed);
-        }
-      });
-      workerMessenger.on(WorkerMessengerCommand.AmpSubscribe, async () => {
-        Log.debug('[Service Worker] Received AMP subscribe message.');
-        const appId = await this.getAppId();
-        const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
-        const context = new ContextSW(appConfig);
-        const rawSubscription = await context.subscriptionManager.subscribe(SubscriptionStrategyKind.ResubscribeExisting);
-        const subscription = await context.subscriptionManager.registerSubscription(rawSubscription);
-        await Database.put('Ids', { type: 'appId', id: appId });
-        workerMessenger.broadcast(WorkerMessengerCommand.AmpSubscribe, subscription.deviceId);
-      });
-      workerMessenger.on(WorkerMessengerCommand.AmpUnsubscribe, async () => {
-        Log.debug('[Service Worker] Received AMP unsubscribe message.');
-        const appId = await this.getAppId();
-        const appConfig = await ConfigHelper.getAppConfig({ appId }, OneSignalApiSW.downloadServerAppConfig);
-        const context = new ContextSW(appConfig);
-        await context.subscriptionManager.unsubscribe(UnsubscriptionStrategy.MarkUnsubscribed);
-        workerMessenger.broadcast(WorkerMessengerCommand.AmpUnsubscribe, null);
-      });
-      workerMessenger.on(
-        WorkerMessengerCommand.AreYouVisibleResponse, async (payload: PageVisibilityResponse) => {
-          Log.debug('[Service Worker] Received response for AreYouVisible', payload);
-          if (!self.clientsStatus) { return; }
-
-          const timestamp = payload.timestamp;
-          if (self.clientsStatus.timestamp !== timestamp) { return; }
-
-          self.clientsStatus.receivedResponsesCount++;
-          if (payload.focused) {
-            self.clientsStatus.hasAnyActiveSessions = true;
-          }
-        }
-      );
-      workerMessenger.on(
-        WorkerMessengerCommand.SetLogging, async (payload: {shouldLog: boolean}) => {
-          if (payload.shouldLog) {
-            self.shouldLog = true;
-          } else {
-            self.shouldLog = undefined;
-          }
-        }
-      );
+      for (const command in messageHandlers) {
+        workerMessenger.on(command as WorkerMessengerCommand, messageHandlers[command]!)
+      }
     },
 
     /**
@@ -1253,7 +1270,8 @@ if (typeof self === "undefined" && typeof global !== "undefined") {
 }
 
 const common = mkCommon({ workerMessenger, database: Database })
-const eventHandling = mkEventHandling({ common, workerMessenger });
+const messageHandlers = mkMessageHandlers({ common, workerMessenger, })
+const eventHandling = mkEventHandling({ common, workerMessenger, messageHandlers });
 const sw: OSServiceWorker = mkServiceWorker({ common, eventHandling });
 export const ServiceWorker = { ...sw, ...eventHandling }; // compat
 
