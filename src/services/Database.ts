@@ -387,8 +387,16 @@ export default class Database {
     return await this.get<boolean>("Options", "userConsent");
   }
 
+  async getCurrentSession(): Promise<Session | null> {
+    return await this.getSession(ONESIGNAL_SESSION_KEY);
+  }
+
   private async getSession(sessionKey: string): Promise<Session | null> {
     return await this.get<Session | null>("Sessions", sessionKey);
+  }
+
+  async upsertSession(session: Session): Promise<void> {
+    await this.setSession(session);
   }
 
   private async setSession(session: Session): Promise<void> {

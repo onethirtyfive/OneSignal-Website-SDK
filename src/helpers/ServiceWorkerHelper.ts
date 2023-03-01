@@ -1,5 +1,5 @@
 import { OneSignalApiSW } from "../OneSignalApiSW";
-import Log from "../libraries/sw/Log";
+import ConditionalLog from "../libraries/sw/ConditionalLog";
 import Path from "../models/Path";
 import { Session, initializeNewSession, SessionOrigin, SessionStatus } from "../models/Session";
 import { OneSignalUtils } from "../utils/OneSignalUtils";
@@ -38,12 +38,12 @@ export default class ServiceWorkerHelper {
     outcomesConfig: OutcomesConfig
   ): Promise<void> {
     if (!deviceId) {
-      Log.error("No deviceId provided for new session.");
+      ConditionalLog.error("No deviceId provided for new session.");
       return;
     }
 
     if (!deviceRecord.app_id) {
-      Log.error("No appId provided for new session.");
+      ConditionalLog.error("No appId provided for new session.");
       return;
     }
 
@@ -67,12 +67,12 @@ export default class ServiceWorkerHelper {
     }
 
     if (existingSession.status === SessionStatus.Active) {
-      Log.debug("Session already active", existingSession);
+      ConditionalLog.debug("Session already active", existingSession);
       return;
     }
 
     if (!existingSession.lastDeactivatedTimestamp) {
-      Log.debug("Session is in invalid state", existingSession);
+      ConditionalLog.debug("Session is in invalid state", existingSession);
       // TODO: possibly recover by re-starting session if deviceId is present?
       return;
     }
@@ -107,7 +107,7 @@ export default class ServiceWorkerHelper {
     const existingSession = await Database.getCurrentSession();
 
     if (!existingSession) {
-      Log.debug("No active session found. Cannot deactivate.");
+      ConditionalLog.debug("No active session found. Cannot deactivate.");
       return undefined;
     }
 
@@ -128,7 +128,7 @@ export default class ServiceWorkerHelper {
      * For anything but active, logging a warning and doing early return.
      */
     if (existingSession.status !== SessionStatus.Active) {
-      Log.warn(`Session in invalid state ${existingSession.status}. Cannot deactivate.`);
+      ConditionalLog.warn(`Session in invalid state ${existingSession.status}. Cannot deactivate.`);
       return undefined;
     }
 
@@ -192,16 +192,16 @@ export default class ServiceWorkerHelper {
   public static async finalizeSession(
     session: Session, sendOnFocusEnabled: boolean, outcomesConfig: OutcomesConfig
   ): Promise<void> {
-    Log.debug(
+    ConditionalLog.debug(
       "Finalize session",
       `started: ${new Date(session.startTimestamp)}`,
       `duration: ${session.accumulatedDuration}s`
     );
 
     if (sendOnFocusEnabled) {
-      Log.debug(`send on_focus reporting session duration -> ${session.accumulatedDuration}s`);
+      ConditionalLog.debug(`send on_focus reporting session duration -> ${session.accumulatedDuration}s`);
       const attribution = await OutcomesHelper.getAttribution(outcomesConfig);
-      Log.debug("send on_focus with attribution", attribution);
+      ConditionalLog.debug("send on_focus with attribution", attribution);
       await OneSignalApiSW.sendSessionDuration(
         session.appId,
         session.deviceId,
@@ -219,7 +219,7 @@ export default class ServiceWorkerHelper {
       Database.cleanupCurrentSession(),
       Database.removeAllNotificationClicked()
     ]);
-    Log.debug(
+    ConditionalLog.debug(
       "Finalize session finished",
       `started: ${new Date(session.startTimestamp)}`
     );
